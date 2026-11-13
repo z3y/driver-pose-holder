@@ -6,6 +6,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+// Controllers still snap back to an incorrect pose right after the pose reports to be valid
+// This value can be increased if controllers pose keeps snapping
+const MIN_VALID_FRAMES: usize = 5;
+
 const PROVIDER_VERSION: &CStr = c"IServerTrackedDeviceProvider_004";
 const HOST_VERSION: &CStr = c"IVRServerDriverHost_006";
 const VR_INIT_ERROR_INTERFACE_NOT_FOUND: i32 = 105;
@@ -230,8 +234,6 @@ unsafe extern "C" fn hook_pose_updated(
     let orig: PoseUpdatedFn = std::mem::transmute(ORIGINAL.load(Ordering::Acquire));
 
     let mut copy = *pose;
-
-    const MIN_VALID_FRAMES: usize = 5;
 
     if !pose.is_null() && device > 0 && device <= 2 && size as usize == size_of::<DriverPose>() {
         let index = (device - 1) as usize;
