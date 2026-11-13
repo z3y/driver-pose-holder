@@ -1,0 +1,11 @@
+[package]
+name = "driver_pose_holder"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "driver_pose_holder"
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
