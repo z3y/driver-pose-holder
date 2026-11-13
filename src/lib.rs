@@ -217,6 +217,7 @@ struct DriverPose {
 }
 
 static mut LAST_VALID_POSES: [Option<DriverPose>; 2] = [None; 2];
+static mut VALID_FRAMES_COUNT: [usize; 2] = [0; 2];
 
 type PoseUpdatedFn = unsafe extern "C" fn(*mut c_void, u32, *const DriverPose, u32);
 
@@ -230,9 +231,22 @@ unsafe extern "C" fn hook_pose_updated(
 
     let mut copy = *pose;
 
+    const MIN_VALID_FRAMES: usize = 5;
+
     if !pose.is_null() && device > 0 && device <= 2 && size as usize == size_of::<DriverPose>() {
         let index = (device - 1) as usize;
-        if !copy.pose_is_valid {
+
+        let mut actually_valid = false;
+        if copy.pose_is_valid {
+            if VALID_FRAMES_COUNT[index] >= MIN_VALID_FRAMES {
+                actually_valid = true;
+            }
+            VALID_FRAMES_COUNT[index] += 1;
+        } else {
+            VALID_FRAMES_COUNT[index] = 0;
+        }
+
+        if !(copy.pose_is_valid && actually_valid) {
             if let Some(last) = LAST_VALID_POSES[index] {
                 copy = last;
                 copy.pose_is_valid = true;
