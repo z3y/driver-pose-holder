@@ -220,8 +220,9 @@ struct DriverPose {
     device_is_connected: bool,
 }
 
-static mut LAST_VALID_POSES: [Option<DriverPose>; 2] = [None; 2];
-static mut VALID_FRAMES_COUNT: [usize; 2] = [0; 2];
+const MAX_DEVICES: usize = 64;
+static mut LAST_VALID_POSES: [Option<DriverPose>; MAX_DEVICES] = [None; MAX_DEVICES];
+static mut VALID_FRAMES_COUNT: [usize; MAX_DEVICES] = [0; MAX_DEVICES];
 
 type PoseUpdatedFn = unsafe extern "C" fn(*mut c_void, u32, *const DriverPose, u32);
 
@@ -233,10 +234,13 @@ unsafe extern "C" fn hook_pose_updated(
 ) {
     let orig: PoseUpdatedFn = std::mem::transmute(ORIGINAL.load(Ordering::Acquire));
 
-    let mut copy = *pose;
-
-    if !pose.is_null() && device > 0 && device <= 2 && size as usize == size_of::<DriverPose>() {
-        let index = (device - 1) as usize;
+    if !pose.is_null()
+        && device > 0
+        && device < (MAX_DEVICES as u32)
+        && size as usize == size_of::<DriverPose>()
+    {
+        let mut copy = *pose;
+        let index = device as usize;
 
         let mut actually_valid = false;
         if copy.pose_is_valid {
@@ -256,7 +260,8 @@ unsafe extern "C" fn hook_pose_updated(
         } else {
             LAST_VALID_POSES[index] = Some(copy);
         }
+        orig(this, device, &copy, size);
+    } else {
+        orig(this, device, pose, size);
     }
-
-    orig(this, device, &copy, size)
 }
