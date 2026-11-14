@@ -21,3 +21,6 @@ drivers/
         driver_pose_holder.dll
 ```
 - Restart SteamVR
+
+This driver will not work correctly with multiple controllers or hand tracking enabled.
+Make sure to disable hand tracking on the Quest itself.
