@@ -3,7 +3,7 @@
 use std::{
     ffi::{CStr, c_char, c_void},
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 // Controllers still snap back to an incorrect pose right after the pose reports to be valid
@@ -89,11 +89,20 @@ struct DriverLogVtable {
     log: unsafe extern "C" fn(*mut DriverLog, *const c_char),
 }
 
-static mut LOGGER: *mut DriverLog = ptr::null_mut();
+static LOGGER: AtomicUsize = AtomicUsize::new(0);
+static PROPERTIES: AtomicUsize = AtomicUsize::new(0);
+
+fn log_string(msg: &String) {
+    let msg = CStr::from_bytes_with_nul(msg.as_bytes());
+    match msg {
+        Ok(msg) => log(msg),
+        Err(_) => log(c"invalid string"),
+    }
+}
 
 fn log(msg: &CStr) {
     unsafe {
-        let logger = LOGGER;
+        let logger = LOGGER.load(Ordering::Acquire) as *mut DriverLog;
         if logger.is_null() {
             return;
         }
@@ -107,11 +116,23 @@ fn log(msg: &CStr) {
 unsafe extern "C" fn provider_init(_this: *mut DeviceProvider, ctx: *mut DriverContext) -> i32 {
     if !ctx.is_null() {
         let mut error: i32 = VR_INIT_ERROR_NONE;
-        let log_ptr =
+        let logger =
             ((*(*ctx).vtable).get_generic_interface)(ctx, c"IVRDriverLog_001".as_ptr(), &mut error);
-        if error == VR_INIT_ERROR_NONE && !log_ptr.is_null() {
-            LOGGER = log_ptr as *mut DriverLog;
+        if error == VR_INIT_ERROR_NONE && !logger.is_null() {
+            LOGGER.store(logger as usize, Ordering::Release);
+            log(c"IVRDriverLog_001 loaded");
         }
+
+        let props = ((*(*ctx).vtable).get_generic_interface)(
+            ctx,
+            c"IVRProperties_001".as_ptr(),
+            &mut error,
+        );
+        if error == VR_INIT_ERROR_NONE && !props.is_null() {
+            PROPERTIES.store(props as usize, Ordering::Release);
+            log(c"IVRProperties_001 loaded");
+        }
+
         install_hook(ctx);
         log(c"driver initialized.");
     }
@@ -221,8 +242,38 @@ struct DriverPose {
 }
 
 const MAX_DEVICES: usize = 64;
-static mut LAST_VALID_POSES: [Option<DriverPose>; MAX_DEVICES] = [None; MAX_DEVICES];
-static mut VALID_FRAMES_COUNT: [usize; MAX_DEVICES] = [0; MAX_DEVICES];
+
+// should be thread safe, each device ID only ever touches its own index
+static mut DEVICE_DATA: [DeviceData; MAX_DEVICES] = [DeviceData::EMPTY; MAX_DEVICES];
+static mut DEVICE_KNOWN: [AtomicBool; MAX_DEVICES] =
+    [const { AtomicBool::new(false) }; MAX_DEVICES];
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceType {
+    Controller,
+    Hand,
+    Other,
+}
+
+struct DeviceData {
+    ty: DeviceType,
+    valid_frames_count: usize,
+    invalid_frames_count: usize,
+    last_valid_pose: Option<DriverPose>,
+    pose_holder_enabled_string: String,
+    pose_holder_disabled_string: String,
+}
+
+impl DeviceData {
+    const EMPTY: DeviceData = DeviceData {
+        ty: DeviceType::Other,
+        valid_frames_count: 0,
+        invalid_frames_count: 0,
+        last_valid_pose: None,
+        pose_holder_enabled_string: String::new(),
+        pose_holder_disabled_string: String::new(),
+    };
+}
 
 type PoseUpdatedFn = unsafe extern "C" fn(*mut c_void, u32, *const DriverPose, u32);
 
@@ -234,34 +285,209 @@ unsafe extern "C" fn hook_pose_updated(
 ) {
     let orig: PoseUpdatedFn = std::mem::transmute(ORIGINAL.load(Ordering::Acquire));
 
+    let index = device as usize;
+
+    let known = DEVICE_KNOWN[index].load(Ordering::Acquire);
+
+    if !known && (*pose).device_is_connected && (*pose).pose_is_valid {
+        let info = fetch_info(device);
+        if let Some(info) = info {
+            const CONTROLLER_ID: i32 = 2;
+            if info.class == CONTROLLER_ID {
+                let ty = if info.is_hand {
+                    DeviceType::Hand
+                } else {
+                    DeviceType::Controller
+                };
+
+                let pose_holder_enabled_string = format!("Enabled for {}\0", info.model);
+                let pose_holder_disabled_string = format!("Disabled for {}\0", info.model);
+
+                DEVICE_DATA[index] = DeviceData {
+                    ty,
+                    valid_frames_count: 0,
+                    invalid_frames_count: 0,
+                    last_valid_pose: None,
+                    pose_holder_enabled_string,
+                    pose_holder_disabled_string,
+                };
+
+                log_string(&format!("Found controller {:?}\0", info));
+            } else {
+                log_string(&format!("Skipping device {:?}\0", info));
+            }
+
+            DEVICE_KNOWN[index].store(true, Ordering::Release);
+        }
+    }
+
     if !pose.is_null()
         && device > 0
         && device < (MAX_DEVICES as u32)
         && size as usize == size_of::<DriverPose>()
+        && known
     {
-        let mut copy = *pose;
-        let index = device as usize;
+        let data = &mut DEVICE_DATA[index];
 
-        let mut actually_valid = false;
-        if copy.pose_is_valid {
-            if VALID_FRAMES_COUNT[index] >= MIN_VALID_FRAMES {
-                actually_valid = true;
+        if data.ty == DeviceType::Controller {
+            let mut copy = *pose;
+            let mut actually_valid = false;
+            if copy.pose_is_valid {
+                if data.valid_frames_count >= MIN_VALID_FRAMES {
+                    actually_valid = true;
+                }
+                if data.valid_frames_count == 0 {}
+                data.valid_frames_count += 1;
+            } else {
+                data.valid_frames_count = 0;
             }
-            VALID_FRAMES_COUNT[index] += 1;
-        } else {
-            VALID_FRAMES_COUNT[index] = 0;
-        }
 
-        if !(copy.pose_is_valid && actually_valid) {
-            if let Some(last) = LAST_VALID_POSES[index] {
-                copy = last;
-                copy.pose_is_valid = true;
+            if !(copy.pose_is_valid && actually_valid) {
+                if let Some(last) = data.last_valid_pose {
+                    copy = last;
+                    copy.pose_is_valid = true;
+                    if data.invalid_frames_count == 0 {
+                        log_string(&data.pose_holder_enabled_string);
+                    }
+                    data.invalid_frames_count += 1;
+                }
+            } else {
+                data.invalid_frames_count = 0;
+                data.last_valid_pose = Some(copy);
             }
+
+            orig(this, device, &copy, size);
         } else {
-            LAST_VALID_POSES[index] = Some(copy);
+            orig(this, device, pose, size);
         }
-        orig(this, device, &copy, size);
     } else {
         orig(this, device, pose, size);
     }
+}
+
+#[repr(C)]
+struct Properties {
+    vtable: *const PropertiesVtable,
+}
+
+#[repr(C)]
+struct PropertiesVtable {
+    read_property_batch: unsafe extern "C" fn(*mut Properties, u64, *mut PropertyRead, u32) -> i32,
+    write_property_batch: usize,
+    get_prop_error_name: usize,
+    tracked_device_to_container: unsafe extern "C" fn(*mut Properties, u32) -> u64,
+}
+
+#[repr(C)]
+struct PropertyRead {
+    prop: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    tag: u32,
+    required_size: u32,
+    error: i32,
+}
+
+unsafe fn read_raw(
+    props: *mut Properties,
+    container: u64,
+    prop: u32,
+    buf: &mut [u8],
+) -> Result<usize, i32> {
+    let mut r = PropertyRead {
+        prop,
+        buffer: buf.as_mut_ptr() as *mut c_void,
+        buffer_size: buf.len() as u32,
+        tag: 0,
+        required_size: 0,
+        error: 0,
+    };
+    ((*(*props).vtable).read_property_batch)(props, container, &mut r, 1);
+    if r.error == 0 {
+        Ok(r.required_size as usize)
+    } else {
+        Err(r.error)
+    }
+}
+
+unsafe fn read_string(props: *mut Properties, container: u64, prop: u32) -> Result<String, i32> {
+    let mut buf = [0u8; 256];
+    let n = read_raw(props, container, prop, &mut buf)?;
+    let n = n.min(buf.len());
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+unsafe fn read_i32(props: *mut Properties, container: u64, prop: u32) -> Result<i32, i32> {
+    let mut buf = [0u8; 4];
+    read_raw(props, container, prop, &mut buf)?;
+    Ok(i32::from_ne_bytes(buf))
+}
+
+const PROP_MODEL_NUMBER: u32 = 1001;
+const PROP_SERIAL_NUMBER: u32 = 1002;
+const PROP_DEVICE_CLASS: u32 = 1029;
+const PROP_CONTROLLER_TYPE: u32 = 7000;
+const PROP_INPUT_PROFILE_PATH: u32 = 1037;
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DeviceInfo {
+    pub class: i32,
+    pub model: String,
+    pub serial: String,
+    pub controller_type: String,
+    pub profile_path: String,
+    pub is_hand: bool,
+}
+
+unsafe fn fetch_info(device: u32) -> Option<DeviceInfo> {
+    let props = PROPERTIES.load(Ordering::Acquire) as *mut Properties;
+    if props.is_null() {
+        return None;
+    }
+
+    let container = ((*(*props).vtable).tracked_device_to_container)(props, device);
+
+    log_string(&format!("Fetching info for device {}\0", device));
+
+    let class = read_i32(props, container, PROP_DEVICE_CLASS).ok()?;
+
+    let mut model = String::new();
+    match read_string(props, container, PROP_MODEL_NUMBER) {
+        Ok(value) => model = value,
+        Err(_) => {}
+    }
+
+    let mut serial = String::new();
+    match read_string(props, container, PROP_SERIAL_NUMBER) {
+        Ok(value) => serial = value,
+        Err(_) => {}
+    }
+
+    let mut controller_type = String::new();
+    match read_string(props, container, PROP_CONTROLLER_TYPE) {
+        Ok(value) => controller_type = value,
+        Err(_) => {}
+    }
+
+    let mut profile_path = String::new();
+    match read_string(props, container, PROP_INPUT_PROFILE_PATH) {
+        Ok(value) => profile_path = value,
+        Err(_) => {}
+    }
+
+    let is_hand = profile_path.to_lowercase().contains("hand")
+        || controller_type.to_lowercase().contains("hand")
+        || model.to_lowercase().contains("hand")
+        || serial.to_lowercase().contains("hand");
+
+    Some(DeviceInfo {
+        class,
+        model,
+        serial,
+        controller_type,
+        profile_path,
+        is_hand,
+    })
 }
