@@ -264,6 +264,7 @@ struct DeviceData {
     last_valid_pose: Option<DriverPose>,
     pose_holder_enabled_string: String,
     pose_holder_disabled_string: String,
+    driver: *mut c_void,
 }
 
 impl DeviceData {
@@ -274,6 +275,7 @@ impl DeviceData {
         last_valid_pose: None,
         pose_holder_enabled_string: String::new(),
         pose_holder_disabled_string: String::new(),
+        driver: ptr::null_mut(),
     };
 }
 
@@ -321,6 +323,7 @@ unsafe extern "C" fn hook_pose_updated(
                     last_valid_pose: None,
                     pose_holder_enabled_string,
                     pose_holder_disabled_string,
+                    driver: this,
                 };
 
                 log_string(&format!("Found controller {:?}\0", info));
@@ -346,6 +349,22 @@ unsafe extern "C" fn hook_pose_updated(
             if (*pose).device_is_connected && (*pose).pose_is_valid {
                 if data.valid_frames_count == 0 {
                     ACTIVE_HANDS.fetch_add(1, Ordering::SeqCst);
+
+                    for index in 1..MAX_DEVICES {
+                        let data = &mut DEVICE_DATA[index];
+                        if data.ty == DeviceType::Controller && !data.driver.is_null() {
+                            match data.last_valid_pose {
+                                Some(mut pose) => {
+                                    if pose.pose_is_valid {
+                                        pose.pose_is_valid = false;
+                                        // force update pose to false for one frame because pose update doesnt run anymore
+                                        orig(data.driver, index as u32, &pose, size);
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
                 }
 
                 data.valid_frames_count += 1;
