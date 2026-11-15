@@ -2,6 +2,8 @@
 
 A small SteamVR driver that freezes your controllers at their last valid pose when tracking is lost, instead of letting SteamVR treat them as idle.
 
+Only tested on a Quest 3 with Steam Link.
+
 ## Why this exists
 
 Quest currently has a bug where the controllers go idle too fast. They report lost tracking and fall asleep much sooner than they should, SteamVR marks them as sleeping, and games respond by moving your  hands down or away. On top of that the next pose reported to be valid is still invalid, which results in hands snapping weirdly back in place once they gain back tracking.
@@ -22,5 +24,5 @@ drivers/
 ```
 - Restart SteamVR
 
-This driver will not work correctly with multiple controllers or hand tracking enabled.
-Make sure to disable hand tracking on the Quest itself.
+Make sure to disable hand tracking on the Quest itself for this to apply.
+This driver will not work correctly with multiple controllers.
