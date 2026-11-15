@@ -248,6 +248,8 @@ static mut DEVICE_DATA: [DeviceData; MAX_DEVICES] = [DeviceData::EMPTY; MAX_DEVI
 static mut DEVICE_KNOWN: [AtomicBool; MAX_DEVICES] =
     [const { AtomicBool::new(false) }; MAX_DEVICES];
 
+static ACTIVE_HANDS: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, PartialEq, Eq)]
 enum DeviceType {
     Controller,
@@ -287,9 +289,18 @@ unsafe extern "C" fn hook_pose_updated(
 
     let index = device as usize;
 
+    if index >= MAX_DEVICES {
+        return orig(this, device, pose, size);
+    }
+
     let known = DEVICE_KNOWN[index].load(Ordering::Acquire);
 
-    if !known && (*pose).device_is_connected && (*pose).pose_is_valid {
+    if !known
+        && !pose.is_null()
+        && size as usize == size_of::<DriverPose>()
+        && (*pose).device_is_connected
+        && (*pose).pose_is_valid
+    {
         let info = fetch_info(device);
         if let Some(info) = info {
             const CONTROLLER_ID: i32 = 2;
@@ -329,7 +340,31 @@ unsafe extern "C" fn hook_pose_updated(
     {
         let data = &mut DEVICE_DATA[index];
 
-        if data.ty == DeviceType::Controller {
+        let mut hand_tracking_active = false;
+
+        if data.ty == DeviceType::Hand {
+            if (*pose).device_is_connected && (*pose).pose_is_valid {
+                if data.valid_frames_count == 0 {
+                    ACTIVE_HANDS.fetch_add(1, Ordering::SeqCst);
+                }
+
+                data.valid_frames_count += 1;
+                data.invalid_frames_count = 0;
+            } else {
+                if data.valid_frames_count > 0 {
+                    ACTIVE_HANDS.fetch_sub(1, Ordering::SeqCst);
+                }
+
+                data.valid_frames_count = 0;
+                data.invalid_frames_count += 1;
+            }
+        }
+
+        if ACTIVE_HANDS.load(Ordering::Acquire) > 0 {
+            hand_tracking_active = true;
+        }
+
+        if data.ty == DeviceType::Controller && !hand_tracking_active {
             let mut copy = *pose;
             let mut actually_valid = false;
             if copy.pose_is_valid {
@@ -449,9 +484,9 @@ unsafe fn fetch_info(device: u32) -> Option<DeviceInfo> {
 
     let container = ((*(*props).vtable).tracked_device_to_container)(props, device);
 
-    log_string(&format!("Fetching info for device {}\0", device));
-
     let class = read_i32(props, container, PROP_DEVICE_CLASS).ok()?;
+
+    log_string(&format!("Fetching info for device {}\0", device));
 
     let mut model = String::new();
     match read_string(props, container, PROP_MODEL_NUMBER) {
